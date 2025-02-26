@@ -1,0 +1,52 @@
+# gazelle:cc_group unit
+
+cc_library(
+    name = "a",
+    hdrs = ["a.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "b",
+    srcs = ["b.c"],
+    hdrs = ["b.h"],
+    visibility = ["//visibility:public"],
+    deps = ["//lib:a"],
+)
+
+cc_library(
+    name = "c",
+    srcs = [
+        "c.cc",
+        "d.cc",
+    ],
+    hdrs = [
+        "c.h",
+        "d.h",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "e",
+    srcs = ["e.cc"],
+    visibility = ["//visibility:public"],
+    deps = ["//lib:c"],
+)
+
+cc_library(
+    name = "multiple_unrelated_deps",
+    srcs = ["multiple_unrelated_deps.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//lib:b",
+        "//lib:c",
+    ],
+)
+
+cc_library(
+    name = "no-deps",
+    srcs = ["no-deps.cc"],
+    visibility = ["//visibility:public"],
+)
+

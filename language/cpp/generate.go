@@ -15,7 +15,7 @@ import (
 func (c *cppLanguage) GenerateRules(args language.GenerateArgs) language.GenerateResult {
 	srcInfo := collectSourceInfos(args)
 	var result = language.GenerateResult{}
-	c.generateLibraryRule(args, srcInfo, &result)
+	c.generateLibraryRules(args, srcInfo, &result)
 	c.generateBinaryRules(args, srcInfo, &result)
 	c.generateTestRule(args, srcInfo, &result)
 
@@ -26,7 +26,7 @@ func (c *cppLanguage) GenerateRules(args language.GenerateArgs) language.Generat
 	return result
 }
 
-func extractImports(args language.GenerateArgs, files []string, sourceInfos map[string]parser.SourceInfo) cppImports {
+func extractImports(args language.GenerateArgs, files []sourceFile, sourceInfos map[sourceFile]parser.SourceInfo) cppImports {
 	includes := []cppInclude{}
 	for _, file := range files {
 		sourceInfo := sourceInfos[file]
@@ -40,33 +40,51 @@ func extractImports(args language.GenerateArgs, files []string, sourceInfos map[
 	return cppImports{includes: includes}
 }
 
-func (c *cppLanguage) generateLibraryRule(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
+func (c *cppLanguage) generateLibraryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
 	allSrcs := slices.Concat(srcInfo.srcs, srcInfo.hdrs)
 	if len(allSrcs) == 0 {
 		return
 	}
-	baseName := filepath.Base(args.Dir)
-	rule := rule.NewRule("cc_library", baseName)
-	if len(srcInfo.srcs) > 0 {
-		rule.SetAttr("srcs", srcInfo.srcs)
+	var srcGroups sourceGroups
+	switch getCppConfig(args.Config).groupingMode {
+	case groupSourcesByDirectory:
+		// All sources grouped together
+		groupName := groupId(filepath.Base(args.Dir))
+		srcGroups = sourceGroups{groupName: {sources: allSrcs}}
+	case groupSourcesByUnit:
+		srcGroups = groupSourcesByHeaders(allSrcs, srcInfo.sourceInfos)
 	}
-	if len(srcInfo.hdrs) > 0 {
-		rule.SetAttr("hdrs", srcInfo.hdrs)
+
+	for _, groupId := range srcGroups.groupIds() {
+		group := srcGroups[groupId]
+		rule := rule.NewRule("cc_library", string(groupId))
+		srcs, hdrs := partitionCSources(group.sources)
+		if len(srcs) > 0 {
+			rule.SetAttr("srcs", sourceFilesToStrings(srcs))
+		}
+		if len(hdrs) > 0 {
+			rule.SetAttr("hdrs", sourceFilesToStrings(hdrs))
+		}
+		if args.File == nil || !args.File.HasDefaultVisibility() {
+			rule.SetAttr("visibility", []string{"//visibility:public"})
+		}
+		imports := extractImports(
+			args,
+			group.sources,
+			srcInfo.sourceInfos,
+		)
+		result.Gen = append(result.Gen, rule)
+		result.Imports = append(result.Imports, imports)
 	}
-	if args.File == nil || !args.File.HasDefaultVisibility() {
-		rule.SetAttr("visibility", []string{"//visibility:public"})
-	}
-	result.Gen = append(result.Gen, rule)
-	result.Imports = append(result.Imports, extractImports(args, allSrcs, srcInfo.sourceInfos))
 }
 
 func (c *cppLanguage) generateBinaryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
 	for _, mainSrc := range srcInfo.mainSrcs {
-		ruleName := strings.TrimSuffix(mainSrc, filepath.Ext(mainSrc))
+		ruleName := mainSrc.baseName()
 		rule := rule.NewRule("cc_binary", ruleName)
-		rule.SetAttr("srcs", []string{mainSrc})
+		rule.SetAttr("srcs", []string{mainSrc.stringValue()})
 		result.Gen = append(result.Gen, rule)
-		result.Imports = append(result.Imports, extractImports(args, []string{mainSrc}, srcInfo.sourceInfos))
+		result.Imports = append(result.Imports, extractImports(args, []sourceFile{mainSrc}, srcInfo.sourceInfos))
 	}
 }
 
@@ -78,30 +96,32 @@ func (c *cppLanguage) generateTestRule(args language.GenerateArgs, srcInfo ccSou
 	baseName := filepath.Base(args.Dir)
 	ruleName := baseName + "_test"
 	rule := rule.NewRule("cc_test", ruleName)
-	rule.SetAttr("srcs", srcInfo.testSrcs)
+	rule.SetAttr("srcs", sourceFilesToStrings(srcInfo.testSrcs))
 	result.Gen = append(result.Gen, rule)
 	result.Imports = append(result.Imports, extractImports(args, srcInfo.testSrcs, srcInfo.sourceInfos))
 }
 
+type sourceFile string
+type sourceInfos map[sourceFile]parser.SourceInfo
 type ccSourceInfoSet struct {
 	// Sources of regular (library) files
-	srcs []string
+	srcs []sourceFile
 	// Headers
-	hdrs []string
+	hdrs []sourceFile
 	// Sources containing main methods
-	mainSrcs []string
+	mainSrcs []sourceFile
 	// Sources containing tests or defined in tests context
-	testSrcs []string
-	// Files that are unrecognised as CC sources
-	unmatched []string
-	// Map contaning informations extracted from recognized CC source
-	sourceInfos map[string]parser.SourceInfo
+	testSrcs []sourceFile
+	// Files that are unrecognized as CC sources
+	unmatched []sourceFile
+	// Map containing information extracted from recognized CC source
+	sourceInfos sourceInfos
 }
 
-func (s *ccSourceInfoSet) buildableSources() []string {
+func (s *ccSourceInfoSet) buildableSources() []sourceFile {
 	return slices.Concat(s.srcs, s.hdrs, s.mainSrcs, s.testSrcs)
 }
-func (s *ccSourceInfoSet) containsBuildableSource(src string) bool {
+func (s *ccSourceInfoSet) containsBuildableSource(src sourceFile) bool {
 	return slices.Contains(s.srcs, src) ||
 		slices.Contains(s.hdrs, src) ||
 		slices.Contains(s.mainSrcs, src) ||
@@ -112,14 +132,15 @@ func (s *ccSourceInfoSet) containsBuildableSource(src string) bool {
 // Parses all matched CC source files to extract additional context
 func collectSourceInfos(args language.GenerateArgs) ccSourceInfoSet {
 	res := ccSourceInfoSet{}
-	res.sourceInfos = map[string]parser.SourceInfo{}
+	res.sourceInfos = map[sourceFile]parser.SourceInfo{}
 
-	for _, file := range args.RegularFiles {
-		if !hasMatchingExtension(file, cExtensions) {
+	for _, fileName := range args.RegularFiles {
+		file := sourceFile(fileName)
+		if !hasMatchingExtension(fileName, cExtensions) {
 			res.unmatched = append(res.unmatched, file)
 			continue
 		}
-		filePath := filepath.Join(args.Dir, file)
+		filePath := filepath.Join(args.Dir, fileName)
 		sourceInfo, err := parser.ParseSourceFile(filePath)
 		if err != nil {
 			log.Printf("Failed to parse source %v, reason: %v", filePath, err)
@@ -127,9 +148,9 @@ func collectSourceInfos(args language.GenerateArgs) ccSourceInfoSet {
 		}
 		res.sourceInfos[file] = sourceInfo
 		switch {
-		case hasMatchingExtension(file, headerExtensions):
+		case hasMatchingExtension(fileName, headerExtensions):
 			res.hdrs = append(res.hdrs, file)
-		case strings.Contains(file, "_test."):
+		case strings.Contains(fileName, "_test."):
 			res.testSrcs = append(res.testSrcs, file)
 		case sourceInfo.HasMain:
 			res.mainSrcs = append(res.mainSrcs, file)
@@ -154,7 +175,7 @@ func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, g
 			continue
 		}
 
-		srcs := []string{}
+		var srcs []string
 		switch r.Kind() {
 		case "cc_library":
 			srcs = r.AttrStrings("srcs")
@@ -165,9 +186,9 @@ func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, g
 			continue
 		}
 
-		// Check wheter at least 1 file mentioned in rule definition sources is buildable (exists)
+		// Check whether at least 1 file mentioned in rule definition sources is buildable (exists)
 		srcsExist := slices.ContainsFunc(srcs, func(src string) bool {
-			return srcInfo.containsBuildableSource(src)
+			return srcInfo.containsBuildableSource(sourceFile(src))
 		})
 
 		if srcsExist {
