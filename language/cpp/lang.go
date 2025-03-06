@@ -34,16 +34,32 @@ func NewLanguage() language.Language {
 // language.Language methods
 func (c *cppLanguage) Kinds() map[string]rule.KindInfo {
 	kinds := make(map[string]rule.KindInfo)
+	mergeMaps := func(m1, m2 map[string]bool) map[string]bool {
+		result := make(map[string]bool, len(m1)+len(m2))
+		for k, v := range m1 {
+			result[k] = v
+		}
+		for k, v := range m2 {
+			result[k] = v
+		}
+		return result
+	}
+
 	for _, commonDef := range ccRuleDefs {
+		// Attributes common to all rules
 		kindInfo := rule.KindInfo{
 			NonEmptyAttrs:  map[string]bool{"srcs": true},
 			MergeableAttrs: map[string]bool{"srcs": true, "deps": true},
 			ResolveAttrs:   map[string]bool{"deps": true},
 		}
 		switch commonDef {
-		case "cc_library", "cc_import":
-			kindInfo.NonEmptyAttrs["hdrs"] = true
-			kindInfo.MergeableAttrs["hdrs"] = true
+		case "cc_library":
+			kindInfo.NonEmptyAttrs = mergeMaps(kindInfo.NonEmptyAttrs, map[string]bool{
+				"hdrs": true,
+			})
+			kindInfo.MergeableAttrs = mergeMaps(kindInfo.MergeableAttrs, map[string]bool{
+				"hdrs": true,
+			})
 		}
 		kinds[commonDef] = kindInfo
 	}

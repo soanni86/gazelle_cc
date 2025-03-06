@@ -2,26 +2,30 @@ package cpp
 
 import (
 	"log"
+	"maps"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/EngFlow/gazelle_cpp/language/internal/cpp/parser"
+	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/bazelbuild/bazel-gazelle/language"
 	"github.com/bazelbuild/bazel-gazelle/rule"
 )
 
 func (c *cppLanguage) GenerateRules(args language.GenerateArgs) language.GenerateResult {
 	srcInfo := collectSourceInfos(args)
+	rulesInfo := extractRulesInfo(args.File)
+
 	var result = language.GenerateResult{}
-	c.generateLibraryRules(args, srcInfo, &result)
-	c.generateBinaryRules(args, srcInfo, &result)
-	c.generateTestRule(args, srcInfo, &result)
+	c.generateLibraryRules(args, srcInfo, rulesInfo, &result)
+	c.generateBinaryRules(args, srcInfo, &rulesInfo, &result)
+	c.generateTestRule(args, srcInfo, &rulesInfo, &result)
 
 	// None of the rules generated above can be empty - it's guaranteed by generating them only if sources exists
 	// However we need to inspect for existing rules that are no longer matching any files
-	result.Empty = c.findEmptyRules(args.File, srcInfo, result.Gen)
+	result.Empty = slices.Concat(result.Empty, c.findEmptyRules(args.File, srcInfo, rulesInfo, result.Gen))
 
 	return result
 }
@@ -40,61 +44,94 @@ func extractImports(args language.GenerateArgs, files []sourceFile, sourceInfos 
 	return cppImports{includes: includes}
 }
 
-func (c *cppLanguage) generateLibraryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
+func (c *cppLanguage) generateLibraryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, rulesInfo rulesInfo, result *language.GenerateResult) {
+	conf := getCppConfig(args.Config)
 	allSrcs := slices.Concat(srcInfo.srcs, srcInfo.hdrs)
 	if len(allSrcs) == 0 {
 		return
 	}
 	var srcGroups sourceGroups
-	switch getCppConfig(args.Config).groupingMode {
+	switch conf.groupingMode {
 	case groupSourcesByDirectory:
 		// All sources grouped together
 		groupName := groupId(filepath.Base(args.Dir))
 		srcGroups = sourceGroups{groupName: {sources: allSrcs}}
 	case groupSourcesByUnit:
-		srcGroups = groupSourcesByHeaders(allSrcs, srcInfo.sourceInfos)
+		srcGroups = groupSourcesByUnits(allSrcs, srcInfo.sourceInfos)
 	}
+
+	ambigiousRuleAssignments := srcGroups.adjustToExistingRules(rulesInfo)
 
 	for _, groupId := range srcGroups.groupIds() {
 		group := srcGroups[groupId]
-		rule := rule.NewRule("cc_library", string(groupId))
+		ruleName := string(groupId)
+		// If there is only 1 target target rule and exactly 1 existing rule reuse it
+		switch len(srcGroups) {
+		case 1:
+			existingRules := rulesInfo.existingRulesOfKind("cc_library", args)
+			if len(existingRules) == 1 {
+				ruleName = existingRules[0].Name()
+			}
+		}
+
+		newRule := rule.NewRule("cc_library", ruleName)
+		// Deal with rules that conflict with existing defintions
+		if ambigiousRuleAssignments, exists := ambigiousRuleAssignments[groupId]; exists {
+			if !c.handleAmbigiousRulesAssignment(args, conf, srcInfo, rulesInfo, newRule, result, *group, ambigiousRuleAssignments) {
+				continue // Failed to handle issue, skip this group. New rule could have been modified
+			}
+		}
+
+		// Assign sources to gorups
 		srcs, hdrs := partitionCSources(group.sources)
 		if len(srcs) > 0 {
-			rule.SetAttr("srcs", sourceFilesToStrings(srcs))
+			newRule.SetAttr("srcs", sourceFilesToStrings(srcs))
 		}
 		if len(hdrs) > 0 {
-			rule.SetAttr("hdrs", sourceFilesToStrings(hdrs))
+			newRule.SetAttr("hdrs", sourceFilesToStrings(hdrs))
 		}
 		if args.File == nil || !args.File.HasDefaultVisibility() {
-			rule.SetAttr("visibility", []string{"//visibility:public"})
+			newRule.SetAttr("visibility", []string{"//visibility:public"})
 		}
-		imports := extractImports(
-			args,
-			group.sources,
-			srcInfo.sourceInfos,
-		)
-		result.Gen = append(result.Gen, rule)
-		result.Imports = append(result.Imports, imports)
+
+		result.Gen = append(result.Gen, newRule)
+		result.Imports = append(result.Imports, extractImports(args, group.sources, srcInfo.sourceInfos))
 	}
 }
 
-func (c *cppLanguage) generateBinaryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
-	for _, mainSrc := range srcInfo.mainSrcs {
-		ruleName := mainSrc.baseName()
+func (c *cppLanguage) generateBinaryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, rulesInfo *rulesInfo, result *language.GenerateResult) {
+	for _, binSource := range srcInfo.mainSrcs {
+		ruleName := binSource.baseName()
+		// If there exists exactly 1 existing rule and 1 target reuse it
+		switch len(srcInfo.mainSrcs) {
+		case 1:
+			existingRules := rulesInfo.existingRulesOfKind("cc_binary", args)
+			if len(existingRules) == 1 {
+				ruleName = existingRules[0].Name()
+			}
+		}
+
 		rule := rule.NewRule("cc_binary", ruleName)
-		rule.SetAttr("srcs", []string{mainSrc.stringValue()})
+		rule.SetAttr("srcs", []string{binSource.stringValue()})
 		result.Gen = append(result.Gen, rule)
-		result.Imports = append(result.Imports, extractImports(args, []sourceFile{mainSrc}, srcInfo.sourceInfos))
+		result.Imports = append(result.Imports, extractImports(args, []sourceFile{binSource}, srcInfo.sourceInfos))
 	}
 }
 
-func (c *cppLanguage) generateTestRule(args language.GenerateArgs, srcInfo ccSourceInfoSet, result *language.GenerateResult) {
+func (c *cppLanguage) generateTestRule(args language.GenerateArgs, srcInfo ccSourceInfoSet, rulesInfo *rulesInfo, result *language.GenerateResult) {
 	if len(srcInfo.testSrcs) == 0 {
 		return
 	}
 	// TODO: group tests by framework (unlikely but possible)
 	baseName := filepath.Base(args.Dir)
 	ruleName := baseName + "_test"
+
+	// If there exists exactly 1 existing rule and 1 target reuse it
+	existingRules := rulesInfo.existingRulesOfKind("cc_test", args)
+	if len(existingRules) == 1 {
+		ruleName = existingRules[0].Name()
+	}
+
 	rule := rule.NewRule("cc_test", ruleName)
 	rule.SetAttr("srcs", sourceFilesToStrings(srcInfo.testSrcs))
 	result.Gen = append(result.Gen, rule)
@@ -161,11 +198,108 @@ func collectSourceInfos(args language.GenerateArgs) ccSourceInfoSet {
 	return res
 }
 
-func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, generatedRules []*rule.Rule) []*rule.Rule {
+// Adjust created sourceGroups based of information from existing rules defintions.
+// * merges with or renames group if all of it sources were previously assigned to existing rule
+// Returns ambigiousRuleAssignments defining a list of groupIds leading to ambigious assignment under the new state -
+// it typically happens when previously independant rules are now creating a cycle
+func (srcGroups *sourceGroups) adjustToExistingRules(rulesInfo rulesInfo) (ambigiousRuleAssignments map[groupId][]string) {
+	ambigiousRuleAssignments = make(map[groupId][]string)
+	// Dictionary of groups that previously were assignled to multiple rules
+	for id, group := range *srcGroups {
+		// Collect info about previous assignment of sources to rules creating this group
+		assignedToRules := make(map[string]bool)
+		for _, src := range group.sources {
+			if groupName, exists := rulesInfo.groupAssignment[src.toGroupId()]; exists {
+				assignedToRules[groupName] = true
+			}
+		}
+		assignedToRuleNames := slices.Collect(maps.Keys(assignedToRules))
+		switch len(assignedToRuleNames) {
+		case 0:
+			// None of the sources are assigned to existing groups, would create a fresh one
+		case 1:
+			// Some of sources were already assigned to rule, would use it as a base
+			existingGroupId := groupId(assignedToRuleNames[0])
+			if id != existingGroupId {
+				srcGroups.renameOrMergeWith(id, existingGroupId)
+			}
+		default:
+			ambigiousRuleAssignments[id] = assignedToRuleNames
+		}
+	}
+	return ambigiousRuleAssignments
+}
+
+// Resolve conflicts when resolved sourceGroups do conflict with existing rule definitions.
+// It mostly deals with problems when sources creating a cyclic dependency are defined in multiple existing rules:
+// * if allowRulesMerge merges all rules refering to this group sources into a single rule
+// * otherwise warns user about cyclic deps and sets cyclic deps attributes to newRule and returns false
+// Returns true if successfully handled issues and it's possible to finalize creation of newRule
+func (c *cppLanguage) handleAmbigiousRulesAssignment(args language.GenerateArgs, conf *cppConfig, srcInfo ccSourceInfoSet, rulesInfo rulesInfo, newRule *rule.Rule, result *language.GenerateResult, group sourceGroup, ambigiousRuleAssignments []string) (handled bool) {
+	switch conf.groupsCycleHandlingMode {
+	case mergeOnGroupsCycle:
+		// Merge rules creating a cyclic dependency into a single rule and remove old ones
+		var mergeReason string
+		switch conf.groupingMode {
+		case groupSourcesByDirectory:
+			mergeReason = "are invalidating the 'cc_group directive' setting"
+		case groupSourcesByUnit:
+			mergeReason = "create a cyclic dependency"
+		default:
+			log.Panicf("Unexpected groupingMode: %v", conf.groupingMode)
+		}
+		log.Printf("Rules %v defined in %v %v, their sources %v would be merged into a single rule '%v'. "+
+			"To prevent automatic merging of rules set `# gazelle:%v %v`",
+			slices.Sorted(slices.Values(ambigiousRuleAssignments)), args.Dir, mergeReason, slices.Sorted(slices.Values(group.sources)), newRule.Name(),
+			cc_group_unit_cycles, warnOnGroupsCycle,
+		)
+		for _, referedRuleName := range ambigiousRuleAssignments {
+			referedRule := rulesInfo.definedRules[referedRuleName]
+			if err := rule.SquashRules(referedRule, newRule, args.File.Path); err != nil {
+				log.Printf("Failed to join rules %v and %v defining a cyclic dependency: %v", referedRuleName, newRule.Name(), err)
+				return false // Skip processing these groups, keep existing rules unchanged
+			}
+			// Remove no longer exisitng rules
+			if referedRuleName != newRule.Name() && slices.Contains(group.subGroups, groupId(newRule.Name())) {
+				result.Empty = append(result.Empty, rule.NewRule(referedRule.Kind(), referedRule.Name()))
+			}
+		}
+		return true
+	case warnOnGroupsCycle:
+		// Merging was disabled by user, don't edit existing rules
+		slices.Sort(ambigiousRuleAssignments) // for deterministic output
+		log.Printf(
+			"Existing cc_library rules %v defined in %v form a cyclic dependency. Possible resolutions:\n"+
+				"  - Set `# gazelle:%v %v` to automatically merge targets to avoid cyclic dependencies.\n"+
+				"  - Manually combine targets to avoid cyclic dependencies.\n"+
+				"  - Remove `#include`s from source files that cause cyclic dependencies: %v",
+			ambigiousRuleAssignments, args.File.Path, cc_group_unit_cycles, mergeOnGroupsCycle, group.sources)
+		// Collect labels to rules creating a cycle
+		deps := make([]label.Label, len(ambigiousRuleAssignments))
+		for idx, group := range ambigiousRuleAssignments {
+			deps[idx] = label.New("", "", group)
+		}
+		// Set recursive dependencies to all rules creating a cycle
+		for _, subGroupId := range group.subGroups {
+			rule, exists := rulesInfo.definedRules[string(subGroupId)]
+			if !exists {
+				continue
+			}
+			rule.SetAttr("deps", deps)
+			result.Gen = append(result.Gen, rule)
+			result.Imports = append(result.Imports, extractImports(args, group.sources, srcInfo.sourceInfos))
+		}
+		return false // Skip processing these groups, keep existing rules unchanged
+	default:
+		log.Panicf("Unknown group cycle handling mode: %v", conf.groupsCycleHandlingMode)
+		return false
+	}
+}
+
+func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, rulesInfo rulesInfo, generatedRules []*rule.Rule) []*rule.Rule {
 	if file == nil {
 		return nil
 	}
-
 	emptyRules := []*rule.Rule{}
 	for _, r := range file.Rules {
 		// Nothing to check if rule with that name was just generated
@@ -174,21 +308,10 @@ func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, g
 		}) {
 			continue
 		}
-
-		var srcs []string
-		switch r.Kind() {
-		case "cc_library":
-			srcs = r.AttrStrings("srcs")
-			srcs = append(srcs, r.AttrStrings("hdrs")...)
-		case "cc_binary", "cc_test":
-			srcs = r.AttrStrings("srcs")
-		default:
-			continue
-		}
-
+		sourceFiles := slices.Collect(maps.Keys(rulesInfo.ccRuleSources[r.Name()]))
 		// Check whether at least 1 file mentioned in rule definition sources is buildable (exists)
-		srcsExist := slices.ContainsFunc(srcs, func(src string) bool {
-			return srcInfo.containsBuildableSource(sourceFile(src))
+		srcsExist := slices.ContainsFunc(sourceFiles, func(src sourceFile) bool {
+			return srcInfo.containsBuildableSource(src)
 		})
 
 		if srcsExist {
@@ -199,4 +322,64 @@ func (c *cppLanguage) findEmptyRules(file *rule.File, srcInfo ccSourceInfoSet, g
 	}
 
 	return emptyRules
+}
+
+type rulesInfo struct {
+	// Map of all rules defined in existing file for quick reference based on rule name
+	definedRules map[string]*rule.Rule
+	// Sources previously assigned to cc rules, key is the existing name of the rule
+	ccRuleSources map[string]sourceFileSet
+	// Mapping between groupId created from sourceFile and existing rule name to which it was previously assigned
+	groupAssignment map[groupId]string
+}
+
+func extractRulesInfo(file *rule.File) rulesInfo {
+	info := rulesInfo{
+		definedRules:    make(map[string]*rule.Rule),
+		ccRuleSources:   make(map[string]sourceFileSet),
+		groupAssignment: make(map[groupId]string),
+	}
+	if file == nil {
+		return info
+	}
+	for _, rule := range file.Rules {
+		ruleName := rule.Name()
+		info.definedRules[ruleName] = rule
+		assignSources := func(srcs []string) {
+			for _, filename := range srcs {
+				srcFile := sourceFile(filename)
+				if _, exists := info.ccRuleSources[ruleName]; !exists {
+					info.ccRuleSources[ruleName] = make(sourceFileSet)
+				}
+				info.ccRuleSources[ruleName][srcFile] = true
+				info.groupAssignment[srcFile.toGroupId()] = ruleName
+			}
+		}
+		switch rule.Kind() {
+		case "cc_library":
+			assignSources(rule.AttrStrings("srcs"))
+			assignSources(rule.AttrStrings("hdrs"))
+		case "cc_binary":
+			assignSources(rule.AttrStrings("srcs"))
+		case "cc_test":
+			assignSources(rule.AttrStrings("srcs"))
+		}
+	}
+	return info
+}
+
+// Return list of existing rules of kind or with matching kind mapping
+func (info *rulesInfo) existingRulesOfKind(kind string, args language.GenerateArgs) []*rule.Rule {
+	rules := make([]*rule.Rule, 0, len(info.ccRuleSources))
+	mappedKind := kind
+	if mapping, exists := args.Config.KindMap[kind]; exists {
+		mappedKind = mapping.KindName
+	}
+	for _, rule := range info.definedRules {
+		switch rule.Kind() {
+		case kind, mappedKind:
+			rules = append(rules, rule)
+		}
+	}
+	return rules
 }
