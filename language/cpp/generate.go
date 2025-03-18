@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/EngFlow/gazelle_cpp/language/internal/cpp/parser"
+	"github.com/bazelbuild/bazel-gazelle/config"
 	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/bazelbuild/bazel-gazelle/language"
 	"github.com/bazelbuild/bazel-gazelle/rule"
@@ -16,7 +17,7 @@ import (
 
 func (c *cppLanguage) GenerateRules(args language.GenerateArgs) language.GenerateResult {
 	srcInfo := collectSourceInfos(args)
-	rulesInfo := extractRulesInfo(args.File)
+	rulesInfo := extractRulesInfo(args)
 
 	var result = language.GenerateResult{}
 	c.generateLibraryRules(args, srcInfo, rulesInfo, &result)
@@ -65,16 +66,22 @@ func (c *cppLanguage) generateLibraryRules(args language.GenerateArgs, srcInfo c
 	for _, groupId := range srcGroups.groupIds() {
 		group := srcGroups[groupId]
 		ruleName := string(groupId)
+		newRule := rule.NewRule("cc_library", ruleName)
 		// If there is only 1 target target rule and exactly 1 existing rule reuse it
 		switch len(srcGroups) {
 		case 1:
 			existingRules := rulesInfo.existingRulesOfKind("cc_library", args)
 			if len(existingRules) == 1 {
-				ruleName = existingRules[0].Name()
+				existing := existingRules[0]
+				newRule.SetName(existing.Name())
+				// Use exisitng kind only when is an alias. Required to allow for correct merge
+				// In case of mapped kinds it would lead to problems in resolve
+				if _, exists := args.Config.AliasMap[existing.Kind()]; exists {
+					newRule.SetKind(existing.Kind())
+				}
 			}
 		}
 
-		newRule := rule.NewRule("cc_library", ruleName)
 		// Deal with rules that conflict with existing defintions
 		if ambigiousRuleAssignments, exists := ambigiousRuleAssignments[groupId]; exists {
 			if !c.handleAmbigiousRulesAssignment(args, conf, srcInfo, rulesInfo, newRule, result, *group, ambigiousRuleAssignments) {
@@ -102,16 +109,22 @@ func (c *cppLanguage) generateLibraryRules(args language.GenerateArgs, srcInfo c
 func (c *cppLanguage) generateBinaryRules(args language.GenerateArgs, srcInfo ccSourceInfoSet, rulesInfo *rulesInfo, result *language.GenerateResult) {
 	for _, binSource := range srcInfo.mainSrcs {
 		ruleName := binSource.baseName()
+		rule := rule.NewRule("cc_binary", ruleName)
 		// If there exists exactly 1 existing rule and 1 target reuse it
 		switch len(srcInfo.mainSrcs) {
 		case 1:
 			existingRules := rulesInfo.existingRulesOfKind("cc_binary", args)
 			if len(existingRules) == 1 {
-				ruleName = existingRules[0].Name()
+				existing := existingRules[0]
+				rule.SetName(existing.Name())
+				// Use exisitng kind only when is an alias. Required to allow for correct merge
+				// In case of mapped kinds it would lead to problems in resolve
+				if _, exists := args.Config.AliasMap[existing.Kind()]; exists {
+					rule.SetKind(existing.Kind())
+				}
 			}
 		}
 
-		rule := rule.NewRule("cc_binary", ruleName)
 		rule.SetAttr("srcs", []string{binSource.stringValue()})
 		result.Gen = append(result.Gen, rule)
 		result.Imports = append(result.Imports, extractImports(args, []sourceFile{binSource}, srcInfo.sourceInfos))
@@ -125,14 +138,20 @@ func (c *cppLanguage) generateTestRule(args language.GenerateArgs, srcInfo ccSou
 	// TODO: group tests by framework (unlikely but possible)
 	baseName := filepath.Base(args.Dir)
 	ruleName := baseName + "_test"
+	rule := rule.NewRule("cc_test", ruleName)
 
 	// If there exists exactly 1 existing rule and 1 target reuse it
 	existingRules := rulesInfo.existingRulesOfKind("cc_test", args)
 	if len(existingRules) == 1 {
-		ruleName = existingRules[0].Name()
+		existing := existingRules[0]
+		rule.SetName(existing.Name())
+		// Use exisitng kind only when is an alias. Required to allow for correct merge
+		// In case of mapped kinds it would lead to problems in resolve
+		if _, exists := args.Config.AliasMap[existing.Kind()]; exists {
+			rule.SetKind(existing.Kind())
+		}
 	}
 
-	rule := rule.NewRule("cc_test", ruleName)
 	rule.SetAttr("srcs", sourceFilesToStrings(srcInfo.testSrcs))
 	result.Gen = append(result.Gen, rule)
 	result.Imports = append(result.Imports, extractImports(args, srcInfo.testSrcs, srcInfo.sourceInfos))
@@ -333,16 +352,16 @@ type rulesInfo struct {
 	groupAssignment map[groupId]string
 }
 
-func extractRulesInfo(file *rule.File) rulesInfo {
+func extractRulesInfo(args language.GenerateArgs) rulesInfo {
 	info := rulesInfo{
 		definedRules:    make(map[string]*rule.Rule),
 		ccRuleSources:   make(map[string]sourceFileSet),
 		groupAssignment: make(map[groupId]string),
 	}
-	if file == nil {
+	if args.File == nil {
 		return info
 	}
-	for _, rule := range file.Rules {
+	for _, rule := range args.File.Rules {
 		ruleName := rule.Name()
 		info.definedRules[ruleName] = rule
 		assignSources := func(srcs []string) {
@@ -355,7 +374,7 @@ func extractRulesInfo(file *rule.File) rulesInfo {
 				info.groupAssignment[srcFile.toGroupId()] = ruleName
 			}
 		}
-		switch rule.Kind() {
+		switch resolveCCRuleKind(rule.Kind(), args.Config) {
 		case "cc_library":
 			assignSources(rule.AttrStrings("srcs"))
 			assignSources(rule.AttrStrings("hdrs"))
@@ -368,16 +387,23 @@ func extractRulesInfo(file *rule.File) rulesInfo {
 	return info
 }
 
+func resolveCCRuleKind(kind string, config *config.Config) string {
+	if target, exists := config.AliasMap[kind]; exists {
+		return target
+	}
+	for _, mapping := range config.KindMap {
+		if mapping.KindName == kind {
+			return mapping.FromKind
+		}
+	}
+	return kind
+}
+
 // Return list of existing rules of kind or with matching kind mapping
 func (info *rulesInfo) existingRulesOfKind(kind string, args language.GenerateArgs) []*rule.Rule {
 	rules := make([]*rule.Rule, 0, len(info.ccRuleSources))
-	mappedKind := kind
-	if mapping, exists := args.Config.KindMap[kind]; exists {
-		mappedKind = mapping.KindName
-	}
 	for _, rule := range info.definedRules {
-		switch rule.Kind() {
-		case kind, mappedKind:
+		if resolveCCRuleKind(rule.Kind(), args.Config) == kind {
 			rules = append(rules, rule)
 		}
 	}
