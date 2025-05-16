@@ -1,4 +1,4 @@
-//> using scala 3.7.0-RC1
+//> using scala 3.7.0
 //> using options --preview -Wunused:all
 //> using jvm 21
 //> using toolkit 0.7.0
@@ -159,7 +159,7 @@ def createHeaderIndex(infos: Seq[ModuleInfo])(using config: Config): (
     def excludePkg = target.pkgRelPath.exists { path =>
       path.segments.headOption.exists(Seq("test").contains) ||
       path.segments.exists: segment =>
-        Seq("third-party", "third_party", "deps", "tests", "internal", "impl")
+        Seq("third-party", "third_party", "3rd_party", "deps", "tests", "internal", "impl")
           .exists(segment.contains)
     }
     excludePkg || excludeName
@@ -171,11 +171,17 @@ def createHeaderIndex(infos: Seq[ModuleInfo])(using config: Config): (
   for
     module <- infos
     target <- module.targets
-    label = target.name.withRepository(module.module.name)
+    label = target.alias
+      .filter: alias =>
+        // Apply alias only if it would allow to relativize the label 
+        alias.pkg.contains(alias.target) 
+        || (alias.pkg.forall(_.isEmpty) && alias.target == module.module.name)
+      .getOrElse(target.name)
+      .withRepository(module.module.name)
     if !shouldExcludeTarget(label)
       .tapIf(_ == true)(_ => recordExcluded(label, target))
     hdr <- target.hdrs
-    path = normalizeHeaderPath(hdr.targetPath, target)
+    path <- normalizeHeaderPath(hdr.targetPath, target)
     if !shouldExcludeHeader(path)
       .tapIf(_ == true)(_ => recordExcluded(label, hdr))
     assignedLabels = headersMapping.getOrElseUpdate(path, mutable.Set.empty)
@@ -209,32 +215,40 @@ def createHeaderIndex(infos: Seq[ModuleInfo])(using config: Config): (
  * Normalizes the path to the format that might be valid for C imports. It applies (strip_)include_prefix and includes
  * attributes to the format that allows the default cc_rules and C compiler to correctly resolve the header
  */
-def normalizeHeaderPath(hdrPath: os.RelPath, target: ModuleTarget): os.RelPath = {
-  val normalizationSteps = Seq[os.RelPath => os.RelPath](
-      path =>
-        target.stripIncludePrefix
-          .filter(path.startsWith)
-          .foldLeft(path)(_.relativeTo(_)),
-      path =>
-        target.includePrefix
-          .foldRight(path)(_ / _),
-      path =>
-        target.includes
-          .filter(path.startsWith)
-          .maxByOption(_.segments.size)
-          .map:
-            case os.rel  => path
-            case include => path.relativeTo(include)
-          .getOrElse(path),
-      path =>
-        target.name.pkgRelPath
-          .filter: _ => // only if none previous normalization were applied
-            path == hdrPath && !target.includes.contains(os.rel)
-          .foldRight(path)(_ / _)
-  )
-  normalizationSteps
-    .reduce(_.andThen(_))
-    .apply(hdrPath)
+def normalizeHeaderPath(hdrPath: os.RelPath, target: ModuleTarget): Seq[os.RelPath] = {
+  // Prepend target pkg to the header name, required to correctly resolve strip_include_prefix
+  def targetPkgResolved(path: os.RelPath): os.RelPath = 
+    target.name.pkgRelPath.foldRight(path)(_ / _)
+    
+  def stripIncludePrefix(path: os.RelPath): os.RelPath = 
+    target.stripIncludePrefix
+      .toSeq
+      .flatMap: prefix =>
+        Seq(prefix, targetPkgResolved(prefix))
+      .find(path.startsWith)
+      .foldLeft(path)(_.relativeTo(_))
+      
+  def includePrefix(path: os.RelPath): os.RelPath = 
+      target.includePrefix.foldRight(path)(_ / _)
+  
+   // Relativize to the longest matching includes
+  def resolveIncludes(path: os.RelPath): Seq[os.RelPath] = 
+    target.includes
+      .map(include => targetPkgResolved(include))
+      .filter(path.startsWith)
+      .map:
+        case os.rel  => path
+        case include => path.relativeTo(include)
+      .match {
+        case Nil => path :: Nil
+        case paths => paths
+      }
+    
+  targetPkgResolved
+  .andThen(stripIncludePrefix)
+  .andThen(resolveIncludes)
+  .apply(hdrPath)
+  .map(includePrefix)
 }
 
 /**
@@ -357,7 +371,7 @@ def resolveTargets(projectRoot: os.Path) = Try {
           "--max_idle_secs=5",
           s"--output_base=$tmpOutputBase",
           "query",
-          s"""kind(cc_.*library, $selector) intersect attr(visibility, //visibility:public, $selector)""",
+          s"""(kind("cc_.*library|alias", $selector) intersect attr(visibility, //visibility:public, $selector)) union kind("expand_template|filegroup", $selector)""",
           s"--output=xml",
           "--keep_going",
           "--incompatible_disallow_empty_glob=false",
@@ -385,8 +399,8 @@ def extractModuleTargets(doc: xml.Document): Seq[ModuleTarget] = {
     def withName(name: String) = nodes.find: node =>
       (node \@ "name") == name
   extension (node: xml.Node)
-    def stringOptAttr(name: String) =
-      (node \ "string")
+    def stringOptAttr(name: String, kind: "string" | "label" | "output" = "string") =
+      (node \ kind)
         .withName(name)
         .map(_ \@ "value")
     def stringListAttr(name: String, kind: "string" | "label" = "string"): List[String] =
@@ -396,16 +410,58 @@ def extractModuleTargets(doc: xml.Document): Seq[ModuleTarget] = {
         .flatMap(_ \ kind)
         .map(_ \@ "value")
   extension (value: String) def toRelPath: os.RelPath = os.RelPath(value.stripPrefix("/"))
+  
+  // Map of cc_library -> alias rules found in project 
+  val aliases: Map[Label, Label] = {
+    for 
+      rule <- doc \ "rule"
+      if rule \@ "class" == "alias"
+      name <- Label.validate(rule \@ "name")
+      target <- rule.stringOptAttr("actual", kind = "label").flatMap(Label.validate)
+    yield (alias=name, target=target)
+  }.groupBy(_.target)
+  .collect:
+    case (target, Seq(singleRef)) => target -> singleRef.alias
+  .toMap
+  
+  val filegroups: Map[Label, Seq[Label]] = {
+    for 
+      rule <- doc \ "rule"
+      if rule \@ "class" == "filegroup"
+      name <- Label.validate(rule \@ "name")
+    yield name -> rule
+      .stringListAttr("srcs", kind = "label")
+      .flatMap(Label.validate)
+      .map(_.relativizeTo(name))
+  }.toMap
+  
+  val expandTemplates: Map[Label, Label] = {
+    for 
+      rule <- doc \ "rule"
+      if rule \@ "class" == "expand_template"
+      name <- Label.validate(rule \@ "name")
+      out <- rule
+      .stringOptAttr("out", kind = "output")
+      .flatMap(Label.validate)
+      .map(_.relativizeTo(name))
+    yield name -> out
+  }.toMap
+   
   for
     rule <- doc \ "rule"
+    if !Seq("alias", "filegroup", "expand_template").contains(rule \@ "class")
     name <- Label.validate(rule \@ "name")
   yield ModuleTarget(
       name = name,
+      alias = aliases.get(name),
       hdrs = rule
         .stringListAttr("hdrs", kind = "label")
         .flatMap(Label.validate)
+        .flatMap: src => 
+          filegroups.get(src)
+          .orElse(expandTemplates.get(src).map(Seq(_)))
+          .getOrElse(Seq(src))
         .map(_.relativizeTo(name)),
-      // textualHdrs = rule.stringListAttr("textual_hdrs", kind = "label").flatMap(Label.validate),
       includes = rule
         .stringListAttr("includes")
         .map(_.toRelPath),
@@ -429,6 +485,7 @@ case class ModuleVersion(name: String, version: String) derives ReadWriter:
 
 case class ModuleTarget(
     name: Label,
+    alias: Option[Label],
     hdrs: List[Label],
     includes: List[os.RelPath],
     stripIncludePrefix: Option[os.RelPath] = None,
@@ -491,18 +548,23 @@ def prepareArchiveModule(url: Uri, targetDir: os.Path, sourcesDir: os.Path, stri
     patchStrip: Option[Int], patchFiles: Set[String]): Try[os.Path] = {
   val fileName = url.path.last
   // Download file with possible retries
-  def downloadArchive(retries: Int): Try[os.Path] =
+  def downloadArchive(retries: Int, options: RequestOptions = basicRequest.options): Try[os.Path] =
     val artifactPath = os.temp.dir(deleteOnExit = true) / fileName
     basicRequest
       .get(url)
       .response(asPathAlways(artifactPath.toNIO))
+      .withOptions(options)
       .send(TryBackend(FollowRedirectsBackend.encodeUriAll(DefaultSyncBackend())))
       .map: response =>
         os.Path(response.body)
       .recoverWith {
-        case _ if retries > 0 =>
+        case ex if retries > 0 =>
           Thread.sleep(Random.nextInt(15).seconds.toMillis)
-          downloadArchive(retries - 1)
+          val newOptions = ex.getCause() match {
+            case _: java.io.UnsupportedEncodingException => options.copy(decompressResponseBody = false)
+            case _ => options
+          }
+          downloadArchive(retries - 1, newOptions)
       }
   downloadArchive(retries = 3)
     .flatMap: artifactPath =>
@@ -622,6 +684,7 @@ object types:
       case s"@$repo//$pkg:$target"  => Some((repo = Some(repo), pkg = Some(pkg), target = target))
       case s"//$pkg:$target"        => Some((repo = None, pkg = Some(pkg), target = target))
       case s":$target"              => Some((repo = None, pkg = None, target = target))
+      case _                        => None
 
 /**
  * Wrapes given computation into caching layer controlled by [[CacheDriver]] If the cache file exists and can be
