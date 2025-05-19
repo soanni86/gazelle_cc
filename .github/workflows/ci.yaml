@@ -13,23 +13,27 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-    
       - name: Build
         run: |
           bazel build //...
-    
       - name: Test
         run: |
           bazel test --test_output=errors //...
           
+  test-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4  
+    - name: Execute end to end tests
+      run: bash .github/workflows/test_e2e.sh
+          
   license-headers:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/license_check.sh 
