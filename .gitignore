@@ -5,3 +5,4 @@ sandbox/*
 .scala-build
 .metals
 .bsp
+applovin-bzldep-index.json
