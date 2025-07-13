@@ -108,6 +108,86 @@ The `cc_search` directive accepts two arguments: a prefix to strip, and a prefix
 
 You can specify `cc_search` directives multiple times. A directive applies to the directory where it's written and to subdirectories. An empty `cc_search` directive resets the list of translation rules for the current directory.
 
+### `# gazelle:cc_platform <os>/<arch> <constraint_label> [<macro>=<value> …]`
+
+Tells gazelle_cc to emit a platform-aware `select()` statement for header dependencies whose `#include` directives are wrapped in pre-processor conditions (`#if`, `#ifdef`, etc).
+
+| Parameter            | Description                                                                                                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `<os>/<arch>`        | Operating-system and CPU pair that identifies the platform (e.g. `linux/amd64`, `darwin/aarch64`).<br>This value is also used to setup default, well known platform specific macro definitions, e.g. `_WIN32`, `__APPLE__`, `__unix__` <br>Valid values follow the constraint settings in [`@platforms//os`](https://github.com/bazelbuild/platforms/blob/1.0.0/os/BUILD) and [`@platforms//cpu`](https://github.com/bazelbuild/platforms/blob/1.0.0/cpu/BUILD). |
+| `<constraint_label>` | A Bazel label that will be used inside the generated `select()` for this platform.                                                                                                               |
+| `[<macro>=<value>]`  | Optional compile-time macros that are **always** true on this platform.<br>Only integer literals are allowed. A bare identifier (e.g. `TARGET_OS_MAC`) is treated as `<macro>=1`.                |
+
+Example:
+
+```bazel
+# BUILD.bazel
+# gazelle:cc_platform windows/x86_64 @platforms//os:windows
+# gazelle:cc_platform osx/aarch64 //platforms/macos_arm USING_MAC USING_ARM64=1
+```
+
+```c
+// source.cc
+#include "shared.h"
+#if defined(_WIN32)
+   #include "win_impl.h"
+#elif USING_MAC
+   #include "mac_impl.h"
+#else
+   #include "unix_impl.h"
+#endif
+```
+
+Running the `gazelle_cc` would emit
+
+```bazel
+cc_library(
+   name = "source",
+   srcs = ["source.cc"],
+   implementation_deps = [":shared"] + select({
+      "@platforms//os:windows": [":win_impl"],
+      "//platforms:macos_arm":  [":mac_impl"],
+      "//conditions:default":   [":unix_impl"],
+   })
+)
+```
+
+Certainly! Here is a **README segment** for the new `# gazelle:cc_embed_headers` directive, matching the style and clarity of your existing documentation:
+
+---
+
+### `# gazelle:cc_embed_headers <headers_dir> <sources_dir>`
+
+Enables automatic dependency resolution between headers and their implementations when they reside in parallel directory trees (for example, `include/` and `src/`).
+When this directive is used, Gazelle will ensure that a `cc_library` containing source files from `<sources_dir>` will depend on the `cc_library` containing the corresponding headers from `<headers_dir>`, as long as the headers and sources share the same relative path.
+
+This is especially useful for codebases where headers and source files are organized in separate trees but follow a mirrored structure.
+
+Both arguments must be clean, relative paths.
+Multiple `cc_embed_headers` directives can be used, and their values are inherited by subdirectories.
+An empty `cc_embed_headers` directive resets the list for the current directory.
+
+#### Example
+
+Suppose you have the following layout:
+
+```
+project/
+├── include/
+│   └── foo.h
+└── src/
+    └── foo.cc
+```
+
+In your `BUILD.bazel` or `BUILD` file:
+
+```
+# gazelle:cc_embed_headers include src
+```
+
+With this configuration, if `src/foo.cc` and `include/foo.h` exist and share a common basename, the rule generated for `src/foo.cc` will automatically depend on the rule generated for `include/foo.h`, making the header reachable for Bazel builds.
+
+
 ## Rules for target rule selection
 
 The extension automatically selects the appropriate rule type based on the following criteria:

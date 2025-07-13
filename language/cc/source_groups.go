@@ -135,11 +135,14 @@ func buildDependencyGraph(sourceFiles []sourceFile, sourceInfos map[sourceFile]p
 		info := sourceInfos[file]
 		node := file.toGroupId()
 		graph[node].sources[file] = true
-		for _, include := range info.Includes.DoubleQuote {
+		for _, include := range info.CollectIncludes() {
+			if include.IsSystem {
+				continue
+			}
 			// Exclude non local headers, these are handled independently as target dependency
 			// The include can be either workspace relative or source file relative
 			for _, baseDir := range []string{"", path.Dir(file.stringValue())} {
-				dep := newSourceFile(baseDir, include)
+				dep := newSourceFile(baseDir, include.Path)
 				if _, exists := graph[dep.toGroupId()]; exists {
 					graph[node].adjacency[dep] = true
 					break
@@ -304,6 +307,11 @@ func (file *sourceFile) isHeader() bool {
 func (s *sourceFile) baseName() string {
 	name := string(*s)
 	return strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
+}
+
+func (s *sourceFile) pathWithoutExt() string {
+	name := string(*s)
+	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
 func (s *sourceFile) stringValue() string {

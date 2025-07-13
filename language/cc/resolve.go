@@ -16,11 +16,12 @@ package cc
 
 import (
 	"log"
-	"maps"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/EngFlow/gazelle_cc/index/internal/collections"
 	"github.com/bazelbuild/bazel-gazelle/config"
 	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/bazelbuild/bazel-gazelle/pathtools"
@@ -29,9 +30,23 @@ import (
 	"github.com/bazelbuild/bazel-gazelle/rule"
 )
 
+const embededHeaderDependenciesKey = "_cc_embeded_deps"
+
 // resolve.Resolver methods
-func (c *ccLanguage) Name() string                                        { return languageName }
-func (c *ccLanguage) Embeds(r *rule.Rule, from label.Label) []label.Label { return nil }
+func (c *ccLanguage) Name() string { return languageName }
+
+func (c *ccLanguage) Embeds(r *rule.Rule, from label.Label) []label.Label {
+	if len(c.headerEmbedingConfigs) == 0 {
+		return nil
+	}
+
+	embedableHdrTargets := c.resolveEmbedableHeaders(from, r.AttrStrings("srcs"))
+
+	// Allows to reference it during imports
+	r.SetPrivateAttr(embededHeaderDependenciesKey, embedableHdrTargets)
+
+	return embedableHdrTargets
+}
 
 func (*ccLanguage) Imports(c *config.Config, r *rule.Rule, f *rule.File) []resolve.ImportSpec {
 	var imports []resolve.ImportSpec
@@ -40,6 +55,9 @@ func (*ccLanguage) Imports(c *config.Config, r *rule.Rule, f *rule.File) []resol
 		if !slices.Contains(r.PrivateAttrKeys(), ccProtoLibraryFilesKey) {
 			break
 		}
+
+		// For each .proto in the target, index the compiler-generated header (foo.proto -> foo.pb.h).
+		// This lets other rules resolve #include "pkg/foo.pb.h" even though the header does not appear in hdrs/outs.
 		protos := r.PrivateAttr(ccProtoLibraryFilesKey).([]string)
 		imports = make([]resolve.ImportSpec, len(protos))
 		for i, protoFile := range protos {
@@ -58,11 +76,42 @@ func (*ccLanguage) Imports(c *config.Config, r *rule.Rule, f *rule.File) []resol
 		if includePrefix != "" {
 			includePrefix = path.Clean(includePrefix)
 		}
-		imports = make([]resolve.ImportSpec, len(hdrs))
-		for i, hdr := range hdrs {
-			hdrRel := path.Join(f.Pkg, hdr)
-			inc := transformIncludePath(f.Pkg, stripIncludePrefix, includePrefix, hdrRel)
-			imports[i] = resolve.ImportSpec{Lang: languageName, Imp: inc}
+		includes := r.AttrStrings("includes")
+		for i, includeDir := range includes {
+			includes[i] = path.Clean(includeDir)
+		}
+
+		// Maximum possible slice: each header is indexed once for its fully-qualified path and at most once for every matching declared -I include directory.
+		imports = make([]resolve.ImportSpec, 0, len(hdrs)*(1+len(includes)))
+		for _, hdr := range hdrs {
+			// Index the canonicalPath form exactly as it will appear in source
+			// Transform the path based on the rule attributes
+			canonicalPath := transformIncludePath(f.Pkg, stripIncludePrefix, includePrefix, path.Join(f.Pkg, hdr))
+			imports = append(imports, resolve.ImportSpec{Lang: languageName, Imp: canonicalPath})
+
+			// Index shorter includes paths made valid by each -I <includeDir>
+			// Bazel adds every entry in the `includes` attribute to the compiler’s search path.
+			// With `includes=[include, include/ext]` header `include/ext/foo.h` can be referenced in 3 different ways:
+			// - include/ext/foo.h - the fully qualified (canonical) form
+			// - ext/foo.h - relative to the `include/` directory (1st 'includes' entry)
+			// - foo.h - relative to the `include/ext/` directory (2nd 'includes' entry)
+			// We index the an alterantive variants here if they are matching the includes directory.
+			for _, includeDir := range includes {
+				relativeTo := path.Join(f.Pkg, includeDir)
+				if includeDir == "." {
+					// Include '.' is special: it makes the path resolvable based from directory defining BUILD file instead of repository root
+					relativeTo = f.Pkg
+				}
+				// Ensure the prefix ends with path separator to distinguish include=foo hdrs=[foo.h, foo/bar.h]
+				// It was already cleaned so there won't be duplicate path seperators here
+				relativeTo = relativeTo + string(filepath.Separator)
+				relativePath, matching := strings.CutPrefix(canonicalPath, relativeTo)
+				if !matching {
+					// If the include directory is not relative to canonical form it's would be simply ignored.
+					continue
+				}
+				imports = append(imports, resolve.ImportSpec{Lang: languageName, Imp: relativePath})
+			}
 		}
 	}
 
@@ -110,18 +159,33 @@ func (lang *ccLanguage) Resolve(c *config.Config, ix *resolve.RuleIndex, rc *rep
 		return
 	}
 	ccImports := imports.(ccImports)
+	ccConfig := getCcConfig(c)
 
-	type labelsSet map[label.Label]struct{}
+	publicDeps := newPlatformDepsBuilder()
+	privateDeps := newPlatformDepsBuilder()
+
+	// Every embeded target is always treated as public shared dependency
+	if embededHdrTargets, ok := r.PrivateAttr(embededHeaderDependenciesKey).([]label.Label); ok {
+		for _, embededTarget := range embededHdrTargets {
+			publicDeps.addGeneric(embededTarget)
+		}
+	}
+
 	// Resolves given includes to rule labels and assigns them to given attribute.
 	// Excludes explicitly provided labels from being assigned
-	// Returns a set of successfully assigned labels, allowing to exclude them in following invocations
-	resolveIncludes := func(includes []ccInclude, attributeName string, excluded labelsSet) labelsSet {
-		deps := make(map[label.Label]struct{})
+	resolveIncludes := func(includes []ccInclude, builder platformDepsBuilder, excluded collections.Set[label.Label]) {
+
 		for _, include := range includes {
-			resolvedLabel := lang.resolveImportSpec(c, ix, from, resolve.ImportSpec{Lang: languageName, Imp: include.normalizedPath})
-			if resolvedLabel == label.NoLabel && !include.isSystemInclude {
+			var resolvedLabel = label.NoLabel
+			// 1. Try resolve using fully qualified path (repository-root relative)
+			if !include.isSystemInclude {
+				relPath := filepath.Join(include.fromDirectory, include.path)
+				resolvedLabel = lang.resolveImportSpec(c, ix, from, resolve.ImportSpec{Lang: languageName, Imp: relPath})
+			}
+			// 2. Try resolve using exact path - using the exact include directive
+			if resolvedLabel == label.NoLabel {
 				// Retry to resolve is external dependency was defined using quotes instead of braces
-				resolvedLabel = lang.resolveImportSpec(c, ix, from, resolve.ImportSpec{Lang: languageName, Imp: include.rawPath})
+				resolvedLabel = lang.resolveImportSpec(c, ix, from, resolve.ImportSpec{Lang: languageName, Imp: include.path})
 			}
 			if resolvedLabel == label.NoLabel {
 				// We typically can get here is given file does not exists or if is assigned to the resolved rule
@@ -129,26 +193,38 @@ func (lang *ccLanguage) Resolve(c *config.Config, ix *resolve.RuleIndex, rc *rep
 			}
 			resolvedLabel = resolvedLabel.Rel(from.Repo, from.Pkg)
 			if _, isExcluded := excluded[resolvedLabel]; !isExcluded {
-				deps[resolvedLabel] = struct{}{}
+				switch {
+				case include.platforms == nil:
+					builder.addGeneric(resolvedLabel)
+				case len(include.platforms) == 0:
+					builder.addConstrained(label.New("", "conditions", "default"), resolvedLabel)
+				default:
+					for _, platform := range include.platforms {
+						if platformConfig, exists := ccConfig.platforms[platform]; exists {
+							builder.addConstrained(platformConfig.constraint, resolvedLabel)
+						}
+					}
+				}
 			}
 		}
-		if len(deps) > 0 {
-			r.SetAttr(attributeName, slices.SortedStableFunc(maps.Keys(deps), func(l, r label.Label) int {
-				return strings.Compare(l.String(), r.String())
-			}))
-		}
-		return deps
 	}
 
 	switch resolveCCRuleKind(r.Kind(), c) {
 	case "cc_library":
 		// Only cc_library has 'implementation_deps' attribute
 		// If depenedncy is added by header (via 'deps') ensure it would not be duplicated inside 'implementation_deps'
-		publicDeps := resolveIncludes(ccImports.hdrIncludes, "deps", make(labelsSet))
-		resolveIncludes(ccImports.srcIncludes, "implementation_deps", publicDeps)
+		resolveIncludes(ccImports.hdrIncludes, publicDeps, collections.Set[label.Label]{})
+		resolveIncludes(ccImports.srcIncludes, privateDeps, publicDeps.all)
 	default:
 		includes := slices.Concat(ccImports.hdrIncludes, ccImports.srcIncludes)
-		resolveIncludes(includes, "deps", make(labelsSet))
+		resolveIncludes(includes, publicDeps, collections.Set[label.Label]{})
+	}
+
+	if len(publicDeps.all) > 0 {
+		r.SetAttr("deps", publicDeps.build())
+	}
+	if len(privateDeps.all) > 0 {
+		r.SetAttr("implementation_deps", privateDeps.build())
 	}
 }
 
@@ -187,4 +263,45 @@ func (lang *ccLanguage) resolveImportSpec(c *config.Config, ix *resolve.RuleInde
 	}
 
 	return label.NoLabel
+}
+
+type platformDepsBuilder struct {
+	// Tracks all found dependencies
+	all collections.Set[label.Label]
+	// Dependencies that are shared by all platforms
+	generic collections.Set[label.Label]
+	// Map of platform specific constraints and dependencies assigned to each of them
+	constrainted map[label.Label]collections.Set[label.Label]
+}
+
+func newPlatformDepsBuilder() platformDepsBuilder {
+	return platformDepsBuilder{
+		all:          make(collections.Set[label.Label]),
+		generic:      make(collections.Set[label.Label]),
+		constrainted: make(map[label.Label]collections.Set[label.Label]),
+	}
+}
+func (b *platformDepsBuilder) addGeneric(dependency label.Label) {
+	b.all.Add(dependency)
+	b.generic.Add(dependency)
+}
+func (b *platformDepsBuilder) addConstrained(condition label.Label, dependency label.Label) {
+	b.all.Add(dependency)
+	deps, exists := b.constrainted[condition]
+	if !exists {
+		deps = make(collections.Set[label.Label])
+		b.constrainted[condition] = deps
+	}
+	deps.Add(dependency)
+}
+func (b *platformDepsBuilder) build() CcPlatformStrings {
+	platformStrings := CcPlatformStrings{[]string{}, map[string][]string{}}
+	toStringsSlice := func(labels collections.Set[label.Label]) []string {
+		return collections.Map(labels.Values(), func(label label.Label) string { return label.String() })
+	}
+	platformStrings.Generic = toStringsSlice(b.generic)
+	for constraintLabel, deps := range b.constrainted {
+		platformStrings.Constrained[constraintLabel.String()] = toStringsSlice(deps)
+	}
+	return platformStrings
 }

@@ -24,6 +24,7 @@ import (
 
 	"maps"
 
+	"github.com/EngFlow/gazelle_cc/language/internal/cc/platform"
 	"github.com/bazelbuild/bazel-gazelle/config"
 	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/bazelbuild/bazel-gazelle/language"
@@ -39,14 +40,21 @@ type (
 		// Set of missing bazel_dep modules referenced in includes but not defined
 		// Used for deduplication of missing modul_dep warnings
 		notFoundBzlModDeps map[string]bool
+		// Configurations for mappings of headers defined in different directory branches then its implementation sources
+		// Notice: used only during resolution of embedings in sources, when indexing using erasable entry in ccConfig (workaround to Gazelle API limitation)
+		headerEmbedingConfigs []ccHeaderEmbedingConfig
+		// Mapping of keys created based on headers
+		embedableHeaders map[string]label.Label
 	}
 	ccInclude struct {
 		// Include path extracted from brackets or double quotes
-		rawPath string
-		// Repository root directory relative rawPath for quoted include, rawPath otherwise
-		normalizedPath string
+		path string
+		// Directory from which include is resolved
+		fromDirectory string
 		// True when include defined using brackets
 		isSystemInclude bool
+		// List of platforms that matched the include #if condition. nil if include is not guarded by preprocessor definitions
+		platforms []platform.Platform
 	}
 	ccImports struct {
 		// #include directives found in header files
@@ -62,8 +70,10 @@ const ccProtoLibraryFilesKey = "_protos"
 
 func NewLanguage() language.Language {
 	return &ccLanguage{
-		bzlmodBuiltInIndex: loadBuiltInBzlModDependenciesIndex(),
-		notFoundBzlModDeps: make(map[string]bool),
+		bzlmodBuiltInIndex:    loadBuiltInBzlModDependenciesIndex(),
+		notFoundBzlModDeps:    make(map[string]bool),
+		embedableHeaders:      make(map[string]label.Label),
+		headerEmbedingConfigs: []ccHeaderEmbedingConfig{},
 	}
 }
 

@@ -18,11 +18,16 @@ import (
 	"errors"
 	"flag"
 	"log"
+	"maps"
 	"path"
 	"path/filepath"
+	"strings"
 	"unicode"
 
+	"github.com/EngFlow/gazelle_cc/language/internal/cc/parser"
+	"github.com/EngFlow/gazelle_cc/language/internal/cc/platform"
 	"github.com/bazelbuild/bazel-gazelle/config"
+	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/bazelbuild/bazel-gazelle/rule"
 )
 
@@ -35,6 +40,8 @@ const (
 	cc_group_unit_cycles = "cc_group_unit_cycles"
 	cc_indexfile         = "cc_indexfile"
 	cc_search            = "cc_search"
+	cc_platform          = "cc_platform"
+	cc_embed_headers     = "cc_embed_headers"
 )
 
 func (c *ccLanguage) KnownDirectives() []string {
@@ -43,6 +50,8 @@ func (c *ccLanguage) KnownDirectives() []string {
 		cc_group_unit_cycles,
 		cc_indexfile,
 		cc_search,
+		cc_platform,
+		cc_embed_headers,
 	}
 }
 
@@ -66,7 +75,7 @@ func (c *ccLanguage) Configure(config *config.Config, rel string, f *rule.File) 
 		case cc_group_unit_cycles:
 			selectDirectiveChoice(&conf.groupsCycleHandlingMode, groupsCycleHandlingModes, d)
 		case cc_indexfile:
-			// New indexfiles replace inherited ones
+			// Reset existing indexfiles
 			if d.Value == "" {
 				conf.dependencyIndexes = []ccDependencyIndex{}
 				continue
@@ -122,6 +131,79 @@ func (c *ccLanguage) Configure(config *config.Config, rel string, f *rule.File) 
 				}
 				conf.ccSearch = append(conf.ccSearch, s)
 			}
+
+		case cc_platform:
+			// Reset existing platforms
+			if d.Value == "" {
+				conf.platforms = map[platform.Platform]platformConfig{}
+				continue
+			}
+			args := strings.Fields(d.Value)
+			if len(args) < 2 {
+				log.Printf("gazelle_cc: invalid %v input: %v - %v", d.Key, d.Value)
+				continue
+			}
+			for i := range args {
+				args[i] = strings.Trim(args[i], "\"")
+			}
+			platformId, err := platform.Parse(args[0])
+			if err != nil {
+				log.Printf("gazelle_cc: invalid %v input for platform identifier '%v': %v", d.Key, args[0], err)
+				continue
+			}
+			constraintLabel, err := label.Parse(args[1])
+			if err != nil {
+				log.Printf("gazelle_cc: invalid %v input for constraint label '%v': %v", d.Key, args[1], err)
+				continue
+			}
+
+			macros, err := parser.ParseMacros(args[2:])
+			if err != nil {
+				log.Printf("gazelle_cc: invalid %v input for platform macro definition '%v': %v", d.Key, d.Value, err)
+			}
+
+			conf.platforms[platformId] = platformConfig{
+				platform:          platformId,
+				constraint:        constraintLabel,
+				userDefinedMacros: macros,
+			}
+
+		case cc_embed_headers:
+			if d.Value == "" {
+				// Special syntax (empty value) to reset directive.
+				conf.headerEmbedingConfigs = []ccHeaderEmbedingConfig{}
+				break
+			}
+			args, err := splitQuoted(d.Value)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+			if len(args) != 2 {
+				log.Printf("# gazelle:cc_embed_headers got %d arguments, expected none or exactly 2, a directory with headers, and directory with corresponding sources", len(args))
+				continue
+			}
+			validateValidPaths := func(checkedPath string, kind string) bool {
+				if path.Clean(checkedPath) != checkedPath {
+					log.Printf("# gazelle:cc_embed_headers: %v path %q is not clean", kind, checkedPath)
+					return false
+				}
+				if path.IsAbs(checkedPath) {
+					log.Printf("# gazelle:cc_embed_headers: %v path %q must be relative", kind, checkedPath)
+					return false
+				}
+				return true
+			}
+			embedingConf := ccHeaderEmbedingConfig{headersDir: args[0], sourcesDir: args[1]}
+			if !validateValidPaths(embedingConf.headersDir, "headers directory") {
+				continue
+			}
+			if !validateValidPaths(embedingConf.sourcesDir, "sources directory") {
+				continue
+			}
+			conf.headerEmbedingConfigs = append(conf.headerEmbedingConfigs, embedingConf)
+			// Extra append-only list of config due to limiatation of Gazelle API in Embeds method
+			c.headerEmbedingConfigs = append(c.headerEmbedingConfigs, embedingConf)
 		}
 	}
 }
@@ -147,6 +229,20 @@ type ccConfig struct {
 	dependencyIndexes []ccDependencyIndex
 	// List of 'gazelle:cc_search' directives, used to construct RelsToIndex.
 	ccSearch []ccSearch
+	// Platforms for which os/arch specific selects should be generated
+	platforms map[platform.Platform]platformConfig
+	// Configurations for mappings of headers defined in different directory branches then its implementation sources
+	// Notice: used only when indexing embedable headers, during resolution of embedings in sources uses append-only config defined in ccLanguage (workaround to Gazelle API limitation)
+	headerEmbedingConfigs []ccHeaderEmbedingConfig
+}
+
+// Defines a configuration for header embeding allowing to map header to it's implementation
+// if they're defined in different subdirectories, but have the same paths relative to hdr/src roots
+type ccHeaderEmbedingConfig struct {
+	// path to directory contaning headers that should be embedable
+	headersDir string
+	// path to directory contaning implementation for embedable headers
+	sourcesDir string
 }
 
 type ccSearch struct {
@@ -171,6 +267,8 @@ func newCcConfig() *ccConfig {
 		groupsCycleHandlingMode: mergeOnGroupsCycle,
 		dependencyIndexes:       []ccDependencyIndex{},
 		ccSearch:                defaultCcSearch(),
+		platforms:               map[platform.Platform]platformConfig{},
+		headerEmbedingConfigs:   []ccHeaderEmbedingConfig{},
 	}
 }
 
@@ -179,8 +277,10 @@ func (conf *ccConfig) clone() *ccConfig {
 		groupingMode:            conf.groupingMode,
 		groupsCycleHandlingMode: conf.groupsCycleHandlingMode,
 		// No deep cloning of dependency indexes to reduce memory usage
-		dependencyIndexes: conf.dependencyIndexes[:len(conf.dependencyIndexes):len(conf.dependencyIndexes)],
-		ccSearch:          conf.ccSearch[:len(conf.ccSearch):len(conf.ccSearch)],
+		dependencyIndexes:     conf.dependencyIndexes[:len(conf.dependencyIndexes):len(conf.dependencyIndexes)],
+		ccSearch:              conf.ccSearch[:len(conf.ccSearch):len(conf.ccSearch)],
+		platforms:             maps.Clone(conf.platforms),
+		headerEmbedingConfigs: conf.headerEmbedingConfigs[:len(conf.headerEmbedingConfigs):len(conf.headerEmbedingConfigs)],
 	}
 }
 
@@ -189,6 +289,27 @@ func (conf *ccConfig) clone() *ccConfig {
 // We don't ask the user to write this explicitly.
 func defaultCcSearch() []ccSearch {
 	return []ccSearch{{}}
+}
+
+type platformConfig struct {
+	platform          platform.Platform
+	constraint        label.Label
+	userDefinedMacros platform.Macros
+}
+
+func (pc platformConfig) allMacros() platform.Macros {
+	macros := make(platform.Macros)
+	maps.Copy(macros, platform.KnownPlatformMacros[pc.platform])
+	maps.Copy(macros, pc.userDefinedMacros)
+	return macros
+}
+
+func (conf ccConfig) platformMacros() map[platform.Platform]platform.Macros {
+	result := map[platform.Platform]platform.Macros{}
+	for platform, config := range conf.platforms {
+		result[platform] = config.allMacros()
+	}
+	return result
 }
 
 type sourceGroupingMode string
