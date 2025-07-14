@@ -446,6 +446,7 @@ func (p *parser) parseDirectivesUntil(shouldStop func(token string) bool) ([]Dir
 		switch {
 		case strings.HasPrefix(token, "#"):
 			directive, err := p.parseDirective(token)
+			fmt.Printf("+++%v+++\n", directive)
 			if err != nil {
 				p.skipLine()
 				// log.Printf("Failed to parse %v directive: %v, skipping tokens until end of line: %v", token, err, skipped)
