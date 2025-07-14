@@ -232,6 +232,7 @@ func (p *parser) parseExprPrecedence(minPrecedence precedence) (Expr, error) {
 			return result, nil // current operator binds less – stop and return
 		}
 		p.tr.mustConsume(token)
+		fmt.Printf("^^^p=%v, token=%v, result=%v^^^", p, token, result)
 		result, err = rule.infixParser(p, token, result)
 		if err != nil {
 			return nil, err
@@ -447,6 +448,7 @@ func (p *parser) parseDirectivesUntil(shouldStop func(token string) bool) ([]Dir
 		case strings.HasPrefix(token, "#"):
 			fmt.Printf("+++%s+++\n", token)
 			directive, err := p.parseDirective(token)
+			fmt.Printf("***%v***\n", directive)
 			if err != nil {
 				p.skipLine()
 				// log.Printf("Failed to parse %v directive: %v, skipping tokens until end of line: %v", token, err, skipped)
