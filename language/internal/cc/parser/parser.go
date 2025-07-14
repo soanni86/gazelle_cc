@@ -112,7 +112,7 @@ func ParseSource(input string) (SourceInfo, error) {
 
 // ParseSourceFile opens `filename“ and feeds its contents to the extractor.
 func ParseSourceFile(filename string) (SourceInfo, error) {
-	fmt.Printf("... Parsing file %s ...", filename)
+	fmt.Printf("... Parsing file %s ...\n", filename)
 	file, err := os.Open(filename)
 	if err != nil {
 		return SourceInfo{}, err
@@ -222,6 +222,7 @@ func (p *parser) parseExprPrecedence(minPrecedence precedence) (Expr, error) {
 
 	for {
 		token, ok := p.tr.peek()
+		fmt.Printf("---%s---\n", token)
 		if !ok {
 			return result, nil // end of input
 		}
