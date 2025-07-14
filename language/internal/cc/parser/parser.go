@@ -112,6 +112,7 @@ func ParseSource(input string) (SourceInfo, error) {
 
 // ParseSourceFile opens `filename“ and feeds its contents to the extractor.
 func ParseSourceFile(filename string) (SourceInfo, error) {
+	fmt.Printf("... Parsing file %s ...", filename)
 	file, err := os.Open(filename)
 	if err != nil {
 		return SourceInfo{}, err
